@@ -197,17 +197,53 @@ export class SnapshotError extends Error {
 const DAY_MS = 86_400_000;
 
 /** A finite number, else `fallback`. */
-function finite(value: unknown, fallback: number): number {
+function finiteOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/** Seven-day growth clamped to the model's band, so one wild week cannot dominate a row. */
+function clampGrowth(rawGrowth: number, model: ModelConstants): number {
+  const lower = model.growth_floor;
+  const upper = model.growth_cap;
+  if (rawGrowth < lower) return lower;
+  if (rawGrowth > upper) return upper;
+  return rawGrowth;
+}
+
+/** The growth multiplier: rallies lift a row, declines cut it harder. */
+function growthMultiplier(growthPct: number, model: ModelConstants): number {
+  if (growthPct >= 0) return 1 + (growthPct / 100) * model.growth_weight_up;
+  return 1 + (growthPct / 100) * model.growth_weight_down;
+}
+
+/** The momentum multiplier: a strong move in either direction gets a small extra push. */
+function momentumMultiplier(growthPct: number, model: ModelConstants): number {
+  if (growthPct >= model.momentum_threshold) return model.momentum_up;
+  if (growthPct <= -model.momentum_threshold) return model.momentum_down;
+  return 1;
+}
+
+/** The maturity multiplier: log age, so two years with no token counts far more than two months. */
+function maturityMultiplier(ageDays: number | null, model: ModelConstants): number {
+  const age = ageDays ?? model.unknown_age_days;
+  const capped = Math.min(Math.max(age, 0), model.maturity_days);
+  const share = Math.log(1 + capped) / Math.log(1 + model.maturity_days);
+  return model.maturity_floor + share * model.maturity_range;
+}
+
+/** The chain multiplier: one extra chain at a time, up to four. */
+function chainMultiplier(chainCount: number, model: ModelConstants): number {
+  const extra = Math.min(Math.max(chainCount - 1, 0), model.chain_max_extra);
+  return 1 + model.chain_step * extra;
 }
 
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
-  const a = Date.parse(`${asOf}T00:00:00Z`);
-  const b = Date.parse(`${listedAt}T00:00:00Z`);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  return Math.max(0, Math.floor((a - b) / DAY_MS));
+  const start = Date.parse(`${asOf}T00:00:00Z`);
+  const listed = Date.parse(`${listedAt}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(listed)) return null;
+  return Math.max(0, Math.floor((start - listed) / DAY_MS));
 }
 
 /** The sector multiplier for a category: fee-capturing markets score a little higher. */
@@ -218,24 +254,18 @@ export function sectorMultiplier(category: string | null): number {
   return 1.0;
 }
 
-/** The three multipliers and the implied value one protocol gets under `model`. */
+/** The multipliers and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
 ): { implied: number; growthPct: number; growthMult: number; momentum: number; maturityMult: number; chainMult: number; sectorMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = growthPct >= 0
-    ? 1 + (growthPct / 100) * model.growth_weight_up
-    : 1 + (growthPct / 100) * model.growth_weight_down;
-  const momentum = growthPct >= model.momentum_threshold ? model.momentum_up : growthPct <= -model.momentum_threshold ? model.momentum_down : 1;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult =
-    model.maturity_floor +
-    (Math.log(1 + Math.min(Math.max(ageForModel, 0), model.maturity_days)) / Math.log(1 + model.maturity_days)) * model.maturity_range;
-  const chainMult = 1 + model.chain_step * Math.min(Math.max(protocol.chains.length - 1, 0), model.chain_max_extra);
+  const growthPct = clampGrowth(finiteOr(protocol.change_7d, 0), model);
+  const growthMult = growthMultiplier(growthPct, model);
+  const momentum = momentumMultiplier(growthPct, model);
+  const maturityMult = maturityMultiplier(age, model);
+  const chainMult = chainMultiplier(protocol.chains.length, model);
   const sectorMult = sectorMultiplier(protocol.category);
   const base = Math.pow(Math.max(protocol.tvl_usd, 1), model.tvl_exponent) * model.tvl_scale;
   const implied = Math.max(1, Math.round(base * growthMult * momentum * maturityMult * chainMult * sectorMult));
@@ -271,6 +301,18 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
+/** Strongest implied value first, then TVL, then slug: a total order, so the board is stable. */
+function byImpliedThenTvl(
+  a: { implied: number; p: SnapshotProtocol },
+  b: { implied: number; p: SnapshotProtocol },
+): number {
+  if (b.implied !== a.implied) return b.implied - a.implied;
+  if (b.p.tvl_usd !== a.p.tvl_usd) return b.p.tvl_usd - a.p.tvl_usd;
+  if (a.p.slug < b.p.slug) return -1;
+  if (a.p.slug > b.p.slug) return 1;
+  return 0;
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
@@ -288,13 +330,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     const v = impliedValue(p, snapshot.as_of, model);
     return { p, ...v };
   });
-  scored.sort((a, b) => b.implied - a.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  scored.sort(byImpliedThenTvl);
   // Break exact ties deterministically so the board's values strictly fall with rank.
-  let prev = Number.POSITIVE_INFINITY;
+  let previousImplied = Number.POSITIVE_INFINITY;
   return scored.map((s, i) => {
     let implied = s.implied;
-    if (implied >= prev) implied = prev - 1;
-    prev = implied;
+    if (implied >= previousImplied) implied = previousImplied - 1;
+    previousImplied = implied;
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -519,6 +561,11 @@ export function parseSnapshot(text: string): Snapshot {
     if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
       throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
     }
+    if (p.tvl_usd < 0) throw new SnapshotError(`snapshot.json's protocol ${i} has a negative TVL`);
+    // DefiLlama records an unknown market cap as -1, not as a real value:
+    // treat it as unrecorded, so a protocol with no token on record is not
+    // mistaken for one that already trades.
+    const mcap = typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) && p.mcap_usd >= 0 ? p.mcap_usd : null;
     return {
       slug: p.slug,
       name: p.name,
@@ -526,7 +573,7 @@ export function parseSnapshot(text: string): Snapshot {
       chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
       tvl_usd: p.tvl_usd,
       change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
-      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
+      mcap_usd: mcap,
       listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
       gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
@@ -547,15 +594,21 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
   if (missing.length > 0) return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
   const ranks = board.map((r) => r.rank).sort((a, b) => a - b);
-  for (let i = 0; i < ranks.length; i++) if (ranks[i] !== i + 1) return `rank ${i + 1} is ${ranks[i]}`;
-  for (let i = 1; i < board.length; i++) if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) return `row ${i + 1} outranks row ${i} on implied value`;
+  for (let i = 0; i < ranks.length; i++) {
+    if (ranks[i] !== i + 1) return `rank ${i + 1} is ${ranks[i]}`;
+  }
+  for (let i = 1; i < board.length; i++) {
+    if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) return `row ${i + 1} outranks row ${i} on implied value`;
+  }
   if (board.length >= 2 && board[0]!.implied_value_usd === board[board.length - 1]!.implied_value_usd) {
     return `all ${board.length} rows share the same implied value $${board[0]!.implied_value_usd}: a board that ranks nothing by value is not a ranking`;
   }
   for (const r of board) {
     const steps = r.farm_steps;
     if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
-    for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
+    for (const s of steps) {
+      if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
+    }
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
   }
   return null;
