@@ -1,4 +1,4 @@
-// Token Radar radar-2: the entrypoint (Node 22, standard library only).
+// Token Radar radar-3: the entrypoint (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input
 // <file|dir>), scores every rankable pre-token protocol with the model in
@@ -6,6 +6,9 @@
 // dashboard's data beside the page as data.js, copies dashboard/ and
 // screenshots/ to /output, and writes /output/dossier.json with the vendored
 // make.fun library, so the judge reads exactly what the program produced.
+// The model is fitted, not hand-tuned: log(mcap) on log(TVL), fit at
+// runtime on the snapshot's own live-token peers, with the validation the
+// dashboard shows.
 //
 // The dashboard is a static page with no network: dashboard/index.html,
 // dashboard/app.css and dashboard/app.js read the data.js this program
@@ -54,7 +57,7 @@ const outDir = flagValue('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
 const { board, radar } = buildRadar(snapshot);
-const issue = boardIssue(board, snapshot);
+const issue = boardIssue(snapshot, board);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
   process.exit(1);
@@ -100,5 +103,8 @@ writeFileSync(
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    (radar.fit === null
+      ? 'token radar: no fit: fewer than 10 live-token peers, fell back to the radar-2 base\n'
+      : `token radar: fit log(mcap) = ${radar.fit.intercept.toFixed(4)} + ${radar.fit.slope.toFixed(4)} x log(TVL) on ${radar.fit.nComps} peers: R2 ${radar.fit.r2.toFixed(3)}, 5-fold rank correlation ${radar.fit.cvSpearman.toFixed(3)}, 80/20 rank correlation ${radar.fit.holdoutSpearman.toFixed(3)}, walk-forward rank correlation ${radar.fit.walkForwardSpearman === null ? 'n/a' : radar.fit.walkForwardSpearman.toFixed(3)}\n`) +
     `token radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, ${join(outDir, 'dashboard')}, ${join(outDir, 'screenshots')} (${shots.length} images) and ${join(outDir, 'dossier.json')}\n`,
 );
